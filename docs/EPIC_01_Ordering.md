@@ -46,7 +46,18 @@
 
 *   **BR 2.4 (Актуальность данных):** Сайт запрашивает "Время готовности" в момент открытия корзины и повторно валидирует его перед вызовом платежного шлюза, чтобы избежать дезинформации клиента при резком росте очереди.
 
-## 3. Use Case Diagram
+* **BR 2.5 (Валидация и Целостность):**
+Система выполняет Server-side проверку каждого заказа перед оплатой:
+
+  Сверка параметров: Validator (V) выполняет роль интерпретатора: он подтягивает формулу из DB1, берет живые значения коэффициентов из DB2, производит расчет и сравнивает результат с данными, полученными от клиента. Если есть отклонения — транзакция отклоняется.
+
+  Контрольный расчет: Если расчетное время/цена не совпадают с данными от клиента (Front-end), заказ отклоняется с ошибкой 400 Bad Request (Data Mismatch).
+
+  Цель: Исключение манипуляций со стороны клиента и гарантия актуальности данных (например, если за время сборки корзины в админке изменились цены).
+
+
+
+## 3. Component Diagram
 
 ```mermaid
 graph LR
@@ -55,50 +66,45 @@ graph LR
     A((Администратор))
 
     subgraph "Система Заказов (MVP)"
-        C1[Корзина и выбор блюд frontend]
-        C2[Платежный шлюз]
-        V[Validator]
-        ADB[(Analytics DB)]
-        N[Система уведомлений]
-        DB1[(CATALOG)]
-        DB2[(STATIONS_CONFIG)]
+        C1[C1_CART_FRONTEND]
+        C2[C2_PAYMENT_GATEWAY]
+        V[V_VALIDATOR]
+        ADB[(ADB_ANALYTICS)]
+        N[N_NOTIFICATIONS]
+        DB1[(DB1_CATALOG)]
+        DB2[(DB2_STATIONS_CONFIG)]
 
-        %% Группировка S1 и S2 в один логический блок
         subgraph S_Module [Order & Time Logic]
-            S1[(Очередь заказов)]
-            S2(Счетчик времени)
+            S1[(S1_ORDER_QUEUE)]
+            S2(S2_TIME_SERVICE)
         end
     end
 
-    %%Связи
     A -.- DB1
     A -.- DB2
     A -.- ADB
     DB2 -.- DB1
-    DB1 -.- S2
-    DB2 -.- S2
+    DB1 -."Formula + Variables".- S2
+    DB2 -."Formula + Variables".- S2
     DB1 -.-> C1
-    DB2 -.- V
-    DB1 -.- V
+    DB2 -."Formula + Variables".- V
+    DB1 -."Formula + Variables".- V
 
-    %% Путь клиента
     C ---> C1
-    S2 -- "Ближайшее время" --> C1
-    C1 --"Заказ клиента"--> V
+    S2 -- "Broadcast Time" --> C1
+    C1 --"Order"--> V
     
+    V --"Valid"--> C2
+    C2 -- "Paid" --> V
+    V --"Log"--> ADB
+    V --"Push"--> S1
+    S1 -- "Trigger" --> S2
     
-    %% Путь данных
-    V --"Заказ валидный"--> C2
-    C2 -- "Оплата подтверждена" --> V
-    V--"Информация об оплаченом заказе"-->ADB
-    V --"Оплаченный заказ"--> S1
-    S1 -- "Обновление значения" --> S2
-    
-    %% Путь повара и оповещение
-    S1 --"Новый заказ"--> P
-    P -- "Завершение заказа" --> S1
-    S1 -- "Заказ готов" --> N
-    N -. "SMS/PUSH Клиенту" .-> C
+    S1 --"Display"--> P
+    P -- "Next" --> S1
+    S1 -- "Ready" --> N
+    N -. "SMS/Push" .-> C
+
 ```
 
 ## 4. Sequence Diagram
@@ -106,65 +112,89 @@ graph LR
 ```mermaid
 sequenceDiagram
     autonumber
-    participant C as Клиент
-    participant G as Gateway
-    participant S as SlotService
-    participant P as Payment
-    participant K as Kitchen
+    actor C as Клиент
+    participant V as V_VALIDATOR
+    participant S1 as S1_ORDER_QUEUE
+    participant S2 as S2_TIME_SERVICE
+    participant N as N_NOTIFICATIONS
 
-    Note over C, S: Процесс выбора и заказа
-    C->>G: GET /time
-    G->>S: Запрос времени
-    S-->>G: 12:45
-    G-->>C: Показать время
+    Note over C, S2: Сценарий: Новый заказ
+    C->>V: POST /checkout
+    V->>S1: Push Order
+    S1->>S2: Update: Add Prep_Time
+    S2->>S2: Last_Busy_Timestamp += Prep_Time
+    S2-->>N: Broadcast New Time
+    N-->>C: UI Update
 
-    C->>G: POST /pay
-    G->>P: Оплата
-    P-->>C: Банк
+    Note over S1, N: Сценарий: Досрочный финиш
+    actor Chef as Повар
+    Chef->>S1: Нажал "Следующий"
+    S1->>S2: Task finished early
+    S2->>S2: Last_Busy_Timestamp -= Delta
+    S2-->>N: Broadcast New Time
+    N-->>C: UI Update
+    S1->>N: Status: Ready
+    N-->>C: SMS: Заказ готов
 
-    Note over P, K: Запуск в работу
-    P->>G: Успех оплаты
-    G->>S: Фиксация заказа (+15 мин)
-    S->>K: На монитор
-    K-->>C: SMS: "Будет готово в 13:00"
 
-    Note over K, S: Досрочное завершение (BR 2.3)
-    K->>G: Кнопка "Следующий" (раньше срока)
-    G->>S: Сдвиг очереди
-    S-->>C: SMS: "Заказ готов! Можно забирать"
 ```
 
 ## 5. Entity-Relationship Diagram
 
 ```mermaid
 erDiagram
-    CATALOG {
-        string item_id PK
-        string name
-        int prep_time_sec
-        string station_type FK "Связь с цехом"
+    %% Справочный контур
+    DB1_CATALOG ||--o{ S1_ORDER_QUEUE : "provides prep_formula"
+    DB2_STATIONS_CONFIG ||--o{ DB1_CATALOG : "provides active_units"
+    S1_ORDER_QUEUE ||--o| ADB_ANALYTICS : "logs for reporting"
+
+    DB1_CATALOG {
+        int item_id PK
+        int base_prep_time_sec
+        string station_type FK
+        string prep_formula "Интерпретируемая строка"
     }
-    
-    STATIONS_CONFIG {
-        string station_type PK "Гриль/Бар/Фритюр"
-        int active_units "Кол-во поваров/станков"
-        int buffer_time_sec "Время на упаковку"
+
+    DB2_STATIONS_CONFIG {
+        string station_type PK
+        int active_units "Кол-во ресурсов"
+        int buffer_time_sec
     }
+
+    %% Операционный контур
+    S1_ORDER_QUEUE {
+        int order_id PK
+        json order_items "Список блюд и кол-во"
+        string status "Paid/In_Progress/Ready"
+        timestamp Last_Busy_Timestamp "S2 Tracker"
+    }
+
+    %% Аналитика
+    ADB_ANALYTICS {
+        int log_id PK
+        int order_id FK
+        timestamp created_at
+        int actual_lead_time
+    }
+
 
 ```
 
 ## 6. Модель данных (Data Model)
-Система разделена на два контура: Справочный (статичные настройки от Администратора) и Операционный (динамические данные заказов).
+Cистема разделена на два контура: Справочный (статичные настройки от Администратора) и Операционный (динамические данные заказов).
 ### 1. Справочный контур (Admin Managed)
 Эти данные определяют математику расчета и редактируются только Администратором (A).
-*   **BD1 (CATALOG):** Справочник позиций меню.
+#### *   **BD1 (CATALOG):** Справочник позиций меню.
 * **item_id (PK):** Уникальный идентификатор блюда.
-*   **prep_time_sec:** Базовое время приготовления одной единицы.
+*   **base_prep_time_sec:** Чистое время работы оборудования (например, время жарки котлеты).
 *   **station_type (FK):** Привязка к конкретному цеху (Бар/Кухня).
-*   **BD2 (STATIONS_CONFIG):** Конфигурация производственных мощностей.
+*   **prep_formula:** Алгоритм расчета. Система интерпретирует строку (например: (base_prep_time_sec / active_units) + buffer_time). Это позволяет менять логику расчетов для разных категорий блюд без изменения кода сервиса.
+
+
+#### *   **BD2 (STATIONS_CONFIG):** Конфигурация производственных мощностей.
 *   **station_type (PK):** Тип рабочей зоны.
-*   **active_units:** Количество работающих поваров или станков (делитель нагрузки).
-*   **buffer_time_sec:** Добавочное время на упаковку/передачу.
+*   **active_units:** Текущее количество доступных ресурсов. Именно эта переменная подставляется в prep_formula из DB1.
+*   **buffer_time_sec:** Технологический запас.
 ### 2. Операционный контур (Runtime)
 Данные, меняющиеся в режиме реального времени при каждом заказе.
 *   **S1 (Очередь заказов):** Хранилище активных транзакций.
