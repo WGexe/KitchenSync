@@ -1,0 +1,153 @@
+openapi: 3.0.3
+info:
+  title: KitchenSync API
+  description: >
+    API микросервисного оркестратора для фастфуда. 
+    Реализует динамическое управление очередью и валидацию заказов на основе формул.
+  version: 1.0.0
+servers:
+  - url: https://kitchen-sync.ru
+    description: Dev server
+
+paths:
+  /estimates:
+    post:
+      summary: Предварительный расчет времени готовности
+      tags:
+        - Customer
+      description: >
+        Используется фронтендом для отображения Lead Time до начала оплаты. 
+        Учитывает текущую загрузку кухни (S2) и график работы (BR 2.8).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OrderDraft'
+      responses:
+        '200':
+          description: Прогноз времени получен
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  estimated_ready_time:
+                    type: string
+                    format: date-time
+                    description: "Когда будет готов конкретно этот заказ"
+                  last_busy_timestamp:
+                    type: string
+                    format: date-time
+                    description: "Текущий хвост очереди в S2"
+                  accepting_orders:
+                    type: boolean
+                    description: "Доступность заказа на сегодня (BR 2.8). Если false — вместо формы сообщение «Кухня перегружена или рабочий день окончен. Приходите завтра! Наш склад обновляется, чтобы утром еда была максимально свежей»"
+
+
+
+  /orders/checkout:
+    post:
+      summary: Создание заказа и валидация (V_VALIDATOR)
+      tags:
+        - Order
+      description: Проверка цен и времени (BR 2.5) перед переходом к оплате.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OrderCheckout'
+      responses:
+        '201':
+          description: Валидация успешна, ссылка на оплату сформирована
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  payment_url:
+                    type: string
+                  order_id:
+                    type: string
+        '400':
+          description: Data Mismatch (Ошибка валидации формул/цен)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /queue/orders/{order_id}/complete:
+    patch:
+      summary: Досрочное завершение заказа (Кнопка "Следующий")
+      tags:
+        - Kitchen
+      parameters:
+        - name: order_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Заказ завершен, S2_TIME_SERVICE пересчитал очередь (BR 2.3)
+        '404':
+          description: Заказ не найден в S1_ORDER_QUEUE
+
+components:
+  schemas:
+    OrderDraft:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            properties:
+              item_id:
+                type: integer
+              quantity:
+                type: integer
+
+    OrderCheckout:
+      type: object
+      required: [order_id, items, total_price, client_estimated_time]
+      properties:
+        order_id:
+          type: string
+          example: "KS-1002"
+        customer_phone:
+          type: string
+          example: "+79991234567"
+        total_price:
+          type: number
+          description: Цена, которую увидел клиент (для проверки V_VALIDATOR)
+        client_estimated_time:
+          type: string
+          format: date-time
+          description: Время готовности, обещанное клиенту (BR 2.5)
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/OrderItem'
+
+    OrderItem:
+      type: object
+      properties:
+        item_id:
+          type: integer
+        price:
+          type: number
+        quantity:
+          type: integer
+
+    ErrorResponse:
+      type: object
+      properties:
+        error_code:
+          type: string
+          example: "DATA_MISMATCH"
+        message:
+          type: string
+          example: "Расчетная цена не совпадает с присланной"
